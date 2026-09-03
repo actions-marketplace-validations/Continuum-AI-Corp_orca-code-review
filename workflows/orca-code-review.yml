@@ -1,15 +1,14 @@
-# Orca-Code-Review — example consumer workflow.
+# OrcaCode Review — example consumer workflow.
 #
 # Copy this file into your repo at `.github/workflows/` and add one secret,
 # `ORCAROUTER_API_KEY`. The review logic lives in the published action, so you
 # never copy scripts or config — just bump the version tag to update.
 #
-# Cost-tiered cascade: the cheap model reviews every push and the strong model
-# is withheld while any P0/P1 remains (fix those first). Only once the cheap tier
-# is clear does the strong model run the final pass. A severity gate can fail the
+# One review per push: findings post as inline PR comments, and a severity gate
+# can fail the
 # check to block the merge — mark it "required" in branch protection.
 
-name: Orca-Code-Review
+name: OrcaCode Review
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
@@ -17,7 +16,6 @@ concurrency:
 
 on:
   # `synchronize` re-reviews on every new push — the per-commit review loop. The
-  # cascade escalates to the strong tier within a single run (no label-triggered
   # re-run needed — and a GITHUB_TOKEN label change can't trigger one anyway).
   # `ready_for_review` makes the dashboard's trigger=ready_for_review mode fire
   # when a draft PR becomes ready (drafts are skipped in that mode).
@@ -29,21 +27,28 @@ on:
 permissions:
   contents: read
   pull-requests: write
-  issues: write # label-based tier state + clean/fallback PR comments
+  issues: write # clean/fallback PR comments
 
 jobs:
   review:
     runs-on: ubuntu-latest
-    # Run on PR events, or when a trusted user comments `/orca-code-review` on a
-    # PR. The command runs the privileged `pull_request_target` workflow with the
-    # OrcaRouter secret, so only maintainers (owner/member/collaborator) may
-    # trigger it — otherwise any participant could burn paid quota and spam
-    # reviews without pushing new commits.
+    # Run on PR events, or when a trusted user comments the review command on a
+    # PR. All four spellings are accepted — either prefix (`/` or `@`) with
+    # either separator (hyphen or space) — which is the same set the OrcaCode
+    # Review GitHub App takes. Accept the full cross or you build a trap: a
+    # reader who writes the one spelling you left out gets no run and no error
+    # to explain why. The command runs the privileged `pull_request_target`
+    # workflow with the OrcaRouter secret, so only maintainers
+    # (owner/member/collaborator) may trigger it — otherwise any participant
+    # could burn paid quota and spam reviews without pushing new commits.
     if: |
       github.event_name == 'pull_request_target' ||
       (github.event_name == 'issue_comment' &&
         github.event.issue.pull_request &&
-        startsWith(github.event.comment.body, '/orca-code-review') &&
+        (startsWith(github.event.comment.body, '/orcacode-review') ||
+          startsWith(github.event.comment.body, '/orcacode review') ||
+          startsWith(github.event.comment.body, '@orcacode-review') ||
+          startsWith(github.event.comment.body, '@orcacode review')) &&
         contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association))
     steps:
       - uses: Continuum-AI-Corp/orca-code-review@v1
@@ -51,12 +56,13 @@ jobs:
           orcarouter-api-key: ${{ secrets.ORCAROUTER_API_KEY }}
           # All optional — uncomment to override the defaults:
           # orcarouter-url: ${{ secrets.ORCAROUTER_URL }}
-          # brand: "Orca-Code-Review"
-          # router: "orcarouter/code-review"  # router whose DSL picks the model per tier
-          # fix-first: "P0,P1"   # withhold the strong tier until these are fixed
+          # brand: "OrcaCode Review"
+          # router: "orcarouter/orcacode-review"  # router whose DSL picks the model
+          # fix-first: "P0,P1"   # exhaustive only: stop adding passes once one is found
           # block-on: "P0"       # fail the check (block merge) on these
           # max-diff-kb: "512"   # bigger diffs skip the review (outcome: on-oversized-diff)
           # max-diff-files: "300"  # same skip when the diff touches more files than this
           # on-oversized-diff: "fail"  # oversized skip fails the check; "pass" makes it advisory
           # settings: "true"     # "false" skips the dashboard fetch — this file is authoritative
           # report: "true"       # per-run severity counts (never code) to your control plane
+          # timeout-minutes: "20"  # wall-clock ceiling per engine pass; bump for very large PRs
