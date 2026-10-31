@@ -173,12 +173,15 @@ describe("the ❌ count follows block-on", () => {
   // the summary read "❌ 0 findings block merge" beside a held tier line. There is
   // no withholding any more, so what survives is the case that was never about
   // held runs at all.
-  test("the count follows --block-on, not --fix-first", () => {
+  test("the count follows --block-on, and a removed flag cannot steer it", () => {
     // --fix-first is deliberately a DIFFERENT set here: it used to steer this
-    // count on a held run, and now it must not steer it at all.
+    // count on a held run, and now it must not steer it at all. It is no longer
+    // parsed, and it sits in the MIDDLE of the argv on purpose — the flag AND
+    // its value have to be skipped without shifting the --block-on that follows,
+    // which is what lets this script ship ahead of a caller still passing it.
     const out = run(
       ["[P0] a", "[P2] b"],
-      ["--push", "1", "--gate", "blocked", "--block-on", "P2", "--fix-first", "P0"],
+      ["--push", "1", "--fix-first", "P0", "--gate", "blocked", "--block-on", "P2"],
     );
     assert.ok(out.includes("❌ 1 finding blocks merge"), `got:
 ${out}`);
@@ -248,5 +251,51 @@ describe("robustness", () => {
       const r = spawnSync("node", [SUMMARY, join(dir, "x.json"), ...args], { encoding: "utf8" });
       assert.equal(r.status, 2, `args ${JSON.stringify(args)} must exit 2`);
     }
+  });
+});
+
+describe("--excluded: files the engine did not review are listed", () => {
+  const BASE = ["--tier", "standard", "--push", "1", "--gate", "pass"];
+  const excluded = (obj) => {
+    const f = join(dir, `${Math.random().toString(36).slice(2)}-excluded.json`);
+    writeFileSync(f, JSON.stringify(obj));
+    return f;
+  };
+
+  test("each skipped file is listed with its reason, in a collapsible block", () => {
+    const f = excluded({
+      excluded: [
+        { path: "src/a.test.js", code: "default_path", reason: "matches a default exclude pattern" },
+        { path: "logo.png", code: "binary", reason: "binary" },
+      ],
+      omitted: 0,
+    });
+    const out = run([], [...BASE, "--excluded", f]);
+    assert.match(out, /<details><summary>Not reviewed: 2 changed files/);
+    assert.match(out, /`src\/a\.test\.js` \| matches a default exclude pattern/);
+    assert.match(out, /`logo\.png` \| binary/);
+  });
+
+  test("the omitted count beyond the cap is stated", () => {
+    const f = excluded({ excluded: [{ path: "a.snap", code: "default_path", reason: "r" }], omitted: 41 });
+    assert.match(run([], [...BASE, "--excluded", f]), /and 41 more/);
+  });
+
+  test("a hostile file name cannot break out of its table cell or code span", () => {
+    const f = excluded({
+      excluded: [{ path: "x`|<img src=x>\n## Fake heading.js", code: "default_path", reason: "r" }],
+      omitted: 0,
+    });
+    const out = run([], [...BASE, "--excluded", f]);
+    const row = out.split("\n").find((l) => l.includes("img src"));
+    assert.ok(row, "the row is rendered");
+    assert.doesNotMatch(out, /^## Fake heading/m, "a newline in a path started a new markdown block");
+    assert.equal((row.match(/`/g) || []).length, 2, "a backtick in a path broke out of the code span");
+    assert.match(row, /\\\|/, "a pipe in a path is escaped");
+  });
+
+  test("an empty or unreadable list renders nothing", () => {
+    assert.doesNotMatch(run([], [...BASE, "--excluded", excluded({ excluded: [], omitted: 0 })]), /Not reviewed/);
+    assert.doesNotMatch(run([], [...BASE, "--excluded", join(dir, "missing.json")]), /Not reviewed/);
   });
 });

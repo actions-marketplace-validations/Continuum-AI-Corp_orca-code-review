@@ -3,7 +3,17 @@
 //
 //   node summary-comment.mjs <result.json> --tier cheap|strong --push <n>
 //     --gate pass|blocked [--prev <file with the previous comment body>]
-//     [--passes <n>] [--quiet] [--block-on P0,P1] [--held] [--fix-first P0,P1]
+//     [--passes <n>] [--quiet] [--block-on P0,P1] [--excluded <file.json>]
+//     [--lockfiles <file.json>]
+//
+// --lockfiles names guard-diff.mjs's list of changed lockfiles the diff-size
+// limit did not count (the engine still read them); listed the same way.
+//
+// --excluded names excluded-files.mjs's output: the changed files the engine
+// skips (tests, fixtures, generated code, binaries, unsupported types). They
+// are listed under the gate line, so a reader sees what the verdict does NOT
+// cover. File names are attacker-controlled, so each renders inside a code span
+// with control characters, backticks and pipes neutralised.
 //
 // Prints the summary MARKDOWN to stdout. The driver (action.yml) writes it into
 // a marker-delimited region of the PR DESCRIPTION body (scripts/inject-summary.mjs),
@@ -41,9 +51,15 @@
 // a cheap pass withholding the strong review over a fix-first finding — counted
 // over the fix-first set instead, because block-on need not contain those
 // severities and "❌ 0 findings block merge" beside a "held" tier line
-// contradicts itself. There is no held run and no tier line now, so the count
+// contradicts itself. The cascade went, and the tier line with it, so the count
 // and the gate read the same set, which is the property that matters: the
 // summary cannot claim something the merge gate does not enforce.
+//
+// --held and --fix-first went with it here, having been parsed and then read by
+// nothing for as long as the exception has been gone. fix-first REMAINS an action
+// input — it stops the exhaustive loop early, see action.yml — and must not be
+// wired back into this count on the strength of that name: the two answer
+// different questions, which is what the paragraph above is about.
 
 import fs from "node:fs";
 import { SEVERITIES, countSeverities } from "./severity.mjs";
@@ -54,14 +70,13 @@ const STATE_RE = /<!-- orca-cr-state: (\{.*?\}) -->/;
 const usage = () => {
   console.error(
     "usage: node summary-comment.mjs <result.json> --tier cheap|strong --push <n> " +
-      "--gate pass|blocked [--prev <file>] [--passes <n>] [--quiet] [--block-on P0,P1] " +
-      "[--held] [--fix-first P0,P1]",
+      "--gate pass|blocked [--prev <file>] [--passes <n>] [--quiet] [--block-on P0,P1]",
   );
   process.exit(2);
 };
 
 const [file, ...rest] = process.argv.slice(2);
-const opts = { passes: "1", blockOn: "P0,P1", fixFirst: "P0,P1" };
+const opts = { passes: "1", blockOn: "P0,P1" };
 for (let i = 0; i < rest.length; i += 1) {
   if (rest[i] === "--tier") opts.tier = rest[++i];
   else if (rest[i] === "--push") opts.push = rest[++i];
@@ -70,20 +85,23 @@ for (let i = 0; i < rest.length; i += 1) {
   else if (rest[i] === "--passes") opts.passes = rest[++i];
   else if (rest[i] === "--quiet") opts.quiet = true;
   else if (rest[i] === "--block-on") opts.blockOn = rest[++i];
-  else if (rest[i] === "--held") opts.held = true;
-  else if (rest[i] === "--fix-first") opts.fixFirst = rest[++i];
+  else if (rest[i] === "--excluded") opts.excluded = rest[++i];
+  else if (rest[i] === "--lockfiles") opts.lockfiles = rest[++i];
+  // NO else: an unrecognised flag, and the value that follows it, are skipped
+  // one token at a time. That is what makes removing --fix-first safe to ship
+  // ahead of the caller that still passes it — the pair falls through without
+  // shifting the flags after it.
 }
 const push = Number(opts.push);
 const passes = Number(opts.passes);
-// Severity-set normalization shared by --block-on and --fix-first: trim +
-// uppercase, empty = the empty set (valid — "block on nothing" / no fix-first).
+// Severity-set normalization for --block-on: trim + uppercase, empty = the
+// empty set (valid — a deliberate "block on nothing").
 const parseSet = (v) =>
   String(v ?? "")
     .split(",")
     .map((s) => s.trim().toUpperCase())
     .filter(Boolean);
 const blockOn = parseSet(opts.blockOn);
-const fixFirst = parseSet(opts.fixFirst);
 if (
   !file ||
   !["pass", "blocked"].includes(opts.gate) ||
@@ -91,8 +109,7 @@ if (
   push < 1 ||
   !Number.isInteger(passes) ||
   passes < 1 ||
-  blockOn.some((s) => !SEVERITIES.includes(s)) ||
-  fixFirst.some((s) => !SEVERITIES.includes(s))
+  blockOn.some((s) => !SEVERITIES.includes(s))
 ) {
   usage();
 }
@@ -151,7 +168,7 @@ lines.push("");
 // Counted over block-on, which is what the gate enforces. The --held variant
 // (count over fix-first instead) went with the cascade: it existed so a withheld
 // escalation would not render "❌ 0 findings block merge" beside a held tier line,
-// and there is neither withholding nor a tier line any more.
+// and there is neither withholding nor a tier line any more. See the header.
 const blockingSet = blockOn;
 const blocking = blockingSet.reduce((n, s) => n + counts[s], 0);
 lines.push(
@@ -159,5 +176,56 @@ lines.push(
     ? `❌ ${blocking} finding${blocking === 1 ? "" : "s"} block${blocking === 1 ? "s" : ""} merge`
     : "✅ no blocking findings",
 );
+
+// What the verdict above does not cover. Best-effort: an unreadable list
+// renders nothing rather than failing the summary.
+let skipped = { excluded: [], omitted: 0 };
+if (opts.excluded) {
+  try {
+    const j = JSON.parse(fs.readFileSync(opts.excluded, "utf8"));
+    if (Array.isArray(j.excluded)) skipped = { excluded: j.excluded, omitted: Number(j.omitted) || 0 };
+  } catch {
+    /* no list */
+  }
+}
+// One table cell of attacker-controlled text: no line breaks or control
+// characters (they would end the table), no backticks (they would end the code
+// span), pipes escaped (they would end the cell), and a bounded length.
+const cell = (v, max) =>
+  String(v ?? "")
+    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, " ")
+    .replace(/`/g, "'")
+    .slice(0, max)
+    .replace(/\|/g, "\\|");
+if (skipped.excluded.length) {
+  const total = skipped.excluded.length + skipped.omitted;
+  lines.push(
+    "",
+    `<details><summary>Not reviewed: ${total} changed file${total === 1 ? "" : "s"} the review engine skips</summary>`,
+    "",
+    "| File | Why |",
+    "|---|---|",
+    ...skipped.excluded.map((e) => `| \`${cell(e.path, 200)}\` | ${cell(e.reason, 120)} |`),
+  );
+  if (skipped.omitted) lines.push("", `…and ${skipped.omitted} more.`);
+  lines.push("", "</details>");
+}
+
+// Lockfiles the diff-size limit did not count (guard-diff.mjs). Best-effort.
+let lockfiles = [];
+if (opts.lockfiles) {
+  try {
+    const j = JSON.parse(fs.readFileSync(opts.lockfiles, "utf8"));
+    if (Array.isArray(j.lockfiles)) lockfiles = j.lockfiles.slice(0, 50);
+  } catch {
+    /* no list */
+  }
+}
+if (lockfiles.length) {
+  lines.push(
+    "",
+    `Lockfiles not counted toward the diff-size limit: ${lockfiles.map((p) => `\`${cell(p, 200)}\``).join(", ")}.`,
+  );
+}
 
 process.stdout.write(`${lines.join("\n")}\n`);
